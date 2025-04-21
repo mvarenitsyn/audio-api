@@ -1,45 +1,68 @@
 const express = require('express');
-const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
+const fsPromises = require('fs/promises');
 const path = require('path');
+const os = require('os');
+const axios = require('axios');
 
 const app = express();
-const upload = multer({ dest: 'uploads/' });
+app.use(express.json());
 
 // POST /extract-audio
-app.post('/extract-audio', upload.single('file'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ error: 'No video file uploaded.' });
+// Expected JSON body: { "url": "<Google Drive share link>" }
+app.post('/extract-audio', async (req, res) => {
+    const { url } = req.body;
+    if (!url) {
+        return res.status(400).json({ error: 'No URL provided in request body.' });
     }
 
-    const inputPath = req.file.path;
-    const outputFilename = `${path.parse(req.file.originalname).name}.mp3`;
-    const outputPath = path.join('outputs', outputFilename);
+    // Extract Google Drive file ID
+    const idMatch = url.match(/\/d\/([a-zA-Z0-9_-]+)|id=([a-zA-Z0-9_-]+)/);
+    const fileId = idMatch && (idMatch[1] || idMatch[2]);
+    if (!fileId) {
+        return res.status(400).json({ error: 'Invalid Google Drive URL format.' });
+    }
 
-    // Ensure outputs folder exists
-    fs.mkdirSync('outputs', { recursive: true });
+    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
-    ffmpeg(inputPath)
+    // Download video to temp file
+    const videoPath = path.join(os.tmpdir(), `${fileId}.mp4`);
+    try {
+        const response = await axios({ url: downloadUrl, method: 'GET', responseType: 'stream' });
+        await new Promise((resolve, reject) => {
+            const writer = fs.createWriteStream(videoPath);
+            response.data.pipe(writer);
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+        });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to download video', details: err.message });
+    }
+
+    // Extract audio
+    const audioPath = path.join(os.tmpdir(), `${fileId}.mp3`);
+    ffmpeg(videoPath)
         .noVideo()
         .audioCodec('libmp3lame')
         .format('mp3')
-        .save(outputPath)
-        .on('end', () => {
-            // Send the file and then cleanup
-            res.download(outputPath, outputFilename, err => {
-                fs.unlinkSync(inputPath);
-                fs.unlinkSync(outputPath);
+        .save(audioPath)
+        .on('end', async () => {
+            res.download(audioPath, 'extracted_audio.mp3', async (err) => {
+                // Cleanup temp files
+                await fsPromises.unlink(videoPath).catch(() => { });
+                await fsPromises.unlink(audioPath).catch(() => { });
+                if (err) console.error('Error sending file:', err);
             });
         })
-        .on('error', err => {
-            fs.unlinkSync(inputPath);
+        .on('error', async (err) => {
+            await fsPromises.unlink(videoPath).catch(() => { });
+            console.error('FFmpeg error:', err);
             return res.status(500).json({ error: 'Audio extraction failed', details: err.message });
         });
 });
 
-
-// Start server
+// Start server on dynamic PORT
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
